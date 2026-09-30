@@ -77,6 +77,16 @@ def parse_sn_to_nv10077(sn_str: str) -> tuple[bytes, str]:
     )
 
 
+def parse_usb_endpoint(value: str) -> int:
+    try:
+        endpoint = int(value, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid USB endpoint: {value!r}") from exc
+    if not 0 <= endpoint <= 0xFF:
+        raise argparse.ArgumentTypeError("USB endpoint must be between 00 and FF")
+    return endpoint
+
+
 def bitrev8(b: int) -> int:
     return int(f"{b:08b}"[::-1], 2)
 
@@ -129,6 +139,7 @@ class AuRokkuDevice:
         self.pid = pid
         self.sn = sn
         self.interface_num = interface
+        self.interface_alt = 0
         self.ep_out = ep_out
         self.ep_in = ep_in
         self.verbose = verbose
@@ -197,10 +208,16 @@ class AuRokkuDevice:
                 return bytes(data)
         raise RuntimeError("Response exceeds bounded limit")
 
-    def connect(self):
-        self.device = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+    def open_device(self, require_sn: bool = True):
         if self.device is None:
-            raise RuntimeError(f"Device {self.vid:04x}:{self.pid:04x} not found")
+            self.device = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+            if self.device is None:
+                raise RuntimeError(f"Device {self.vid:04x}:{self.pid:04x} not found")
+        elif not require_sn or self.nv_material is not None:
+            return
+
+        if not require_sn:
+            return
 
         device_sn = None
         try:
@@ -226,23 +243,44 @@ class AuRokkuDevice:
             print(f"[INFO] Device SN: {self.sn}", file=sys.stderr)
             print(f"[INFO] NV10077 Raw: {self.nv_material.hex(' ')}", file=sys.stderr)
 
+    def connect(self, require_sn: bool = True):
+        self.open_device(require_sn=require_sn)
+
         cfg = self.device.get_active_configuration()
+        selected_intf = None
         if self.interface_num is None:
             for intf in cfg:
                 eps = {ep.bEndpointAddress for ep in intf}
                 if {self.ep_out, self.ep_in}.issubset(eps):
                     self.interface_num = intf.bInterfaceNumber
+                    self.interface_alt = intf.bAlternateSetting
+                    selected_intf = intf
                     break
             if self.interface_num is None:
-                raise RuntimeError("No interface with the requested endpoints")
+                raise RuntimeError(
+                    f"No interface with EP OUT 0x{self.ep_out:02X} and EP IN 0x{self.ep_in:02X}; "
+                    "run --op probe to list bulk endpoint pairs"
+                )
+        else:
+            for intf in cfg:
+                if intf.bInterfaceNumber != self.interface_num:
+                    continue
+                eps = {ep.bEndpointAddress for ep in intf}
+                if {self.ep_out, self.ep_in}.issubset(eps):
+                    self.interface_alt = intf.bAlternateSetting
+                    selected_intf = intf
+                    break
 
         if self.verbose:
-            print(f"[INFO] Using Interface {self.interface_num}, EP OUT 0x{self.ep_out:02X}, EP IN 0x{self.ep_in:02X}",
+            print(f"[INFO] Using Interface {self.interface_num} alt {self.interface_alt}, "
+                  f"EP OUT 0x{self.ep_out:02X}, EP IN 0x{self.ep_in:02X}",
                   file=sys.stderr)
 
-        intf = cfg[(self.interface_num, 0)]
-        if not {self.ep_out, self.ep_in}.issubset({ep.bEndpointAddress for ep in intf}):
-            raise RuntimeError("Selected interface lacks requested endpoints")
+        if selected_intf is None:
+            raise RuntimeError(
+                f"Interface {self.interface_num} lacks EP OUT 0x{self.ep_out:02X} "
+                f"and EP IN 0x{self.ep_in:02X}; run --op probe to inspect it"
+            )
 
         try:
             if self.device.is_kernel_driver_active(self.interface_num):
@@ -252,7 +290,137 @@ class AuRokkuDevice:
 
         usb.util.claim_interface(self.device, self.interface_num)
         self.claimed = True
+        if self.interface_alt:
+            self.device.set_interface_altsetting(
+                interface=self.interface_num,
+                alternate_setting=self.interface_alt,
+            )
         self.drain()
+
+    def inspect_usb(self) -> dict[str, Any]:
+        self.open_device(require_sn=False)
+        active_value = None
+        try:
+            active_value = self.device.get_active_configuration().bConfigurationValue
+        except Exception:
+            pass
+
+        configurations = []
+        candidates = []
+        for cfg in self.device:
+            cfg_info: dict[str, Any] = {
+                "value": cfg.bConfigurationValue,
+                "active": cfg.bConfigurationValue == active_value,
+                "interfaces": [],
+            }
+            for intf in cfg:
+                intf_info: dict[str, Any] = {
+                    "number": intf.bInterfaceNumber,
+                    "alternate_setting": intf.bAlternateSetting,
+                    "class": f"0x{intf.bInterfaceClass:02x}",
+                    "subclass": f"0x{intf.bInterfaceSubClass:02x}",
+                    "protocol": f"0x{intf.bInterfaceProtocol:02x}",
+                    "endpoints": [],
+                }
+                bulk_in = []
+                bulk_out = []
+                for ep in intf:
+                    address = ep.bEndpointAddress
+                    transfer_type = ep.bmAttributes & 0x03
+                    direction = "in" if address & 0x80 else "out"
+                    intf_info["endpoints"].append({
+                        "address": f"0x{address:02x}",
+                        "direction": direction,
+                        "type": {0: "control", 1: "isochronous", 2: "bulk", 3: "interrupt"}[transfer_type],
+                        "max_packet_size": ep.wMaxPacketSize,
+                        "interval": ep.bInterval,
+                    })
+                    if transfer_type == 2:
+                        (bulk_in if direction == "in" else bulk_out).append(address)
+                for ep_out in bulk_out:
+                    for ep_in in bulk_in:
+                        candidates.append({
+                            "configuration": cfg.bConfigurationValue,
+                            "active": cfg.bConfigurationValue == active_value,
+                            "interface": intf.bInterfaceNumber,
+                            "alternate_setting": intf.bAlternateSetting,
+                            "ep_out": f"0x{ep_out:02x}",
+                            "ep_in": f"0x{ep_in:02x}",
+                        })
+                cfg_info["interfaces"].append(intf_info)
+            configurations.append(cfg_info)
+
+        return {
+            "vid": f"0x{self.vid:04x}",
+            "pid": f"0x{self.pid:04x}",
+            "active_configuration": active_value,
+            "configurations": configurations,
+            "bulk_candidates": candidates,
+        }
+
+    def _read_probe_response(self, timeout_sec: float = 1.0, limit: int = 512) -> bytes:
+        data = bytearray(self.rx_buffer)
+        self.rx_buffer.clear()
+        deadline = time.monotonic() + timeout_sec
+        while len(data) < limit and time.monotonic() < deadline:
+            remaining_ms = max(1, min(200, int((deadline - time.monotonic()) * 1000)))
+            try:
+                part = bytes(self.device.read(self.ep_in, min(512, limit - len(data)), timeout=remaining_ms))
+                if part:
+                    self.log("RX", part)
+                    data.extend(part)
+            except usb.core.USBTimeoutError:
+                if data:
+                    break
+        return bytes(data)
+
+    def probe(self, kind: str = "list", timeout_sec: float = 1.0) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "operation": "probe",
+            "probe": kind,
+            "success": True,
+            "selection": {
+                "interface": self.interface_num,
+                "alternate_setting": self.interface_alt,
+                "ep_out": f"0x{self.ep_out:02x}",
+                "ep_in": f"0x{self.ep_in:02x}",
+            },
+            "usb": self.inspect_usb(),
+        }
+        if kind == "list":
+            return result
+        if not self.claimed:
+            raise RuntimeError("Active probe requires a claimed interface")
+
+        self.drain()
+        if kind == "seri":
+            request = b"\x1c\x05"
+            self.send(request)
+            response = self._read_probe_response(timeout_sec)
+            result.update({
+                "request_hex": request.hex(" "),
+                "response_hex": response.hex(" "),
+                "responsive": bool(response),
+                "matched": response.startswith(request),
+            })
+            result["success"] = result["matched"]
+            if result["matched"] and self.vid != 0x0FCE:
+                self.send(b"\xd8")
+                result["cleanup_hex"] = "d8"
+        elif kind == "scdp":
+            request = b"\x8e"
+            self.send(request)
+            response = self._read_probe_response(timeout_sec)
+            result.update({
+                "request_hex": request.hex(" "),
+                "response_hex": response.hex(" "),
+                "responsive": bool(response),
+                "response_length": len(response),
+            })
+            result["success"] = result["responsive"]
+        else:
+            raise ValueError(f"Unknown probe kind: {kind}")
+        return result
 
     def close(self):
         if self.device is not None:
@@ -699,6 +867,30 @@ def print_human_report(op: str, result: dict[str, Any]):
             val = item.get("decoded") or item.get("lock_value") or item.get("raw_hex")
             print(f"    - {q_name:12s}: {val}")
 
+    elif op == "probe":
+        usb_info = result.get("usb", {})
+        print(f"  Device        : {usb_info.get('vid', '')}:{usb_info.get('pid', '')}")
+        print(f"  Probe Type    : {result.get('probe', '')}")
+        selection = result.get("selection", {})
+        if result.get("probe") != "list":
+            print(f"  Selected      : if {selection.get('interface')} alt {selection.get('alternate_setting')} "
+                  f"OUT {selection.get('ep_out')} IN {selection.get('ep_in')}")
+        candidates = usb_info.get("bulk_candidates", [])
+        if candidates:
+            print("  Bulk Pairs    :")
+            for item in candidates:
+                active = " active" if item.get("active") else ""
+                print(f"    cfg {item['configuration']} if {item['interface']} alt {item['alternate_setting']} "
+                      f"OUT {item['ep_out']} IN {item['ep_in']}{active}")
+        else:
+            print("  Bulk Pairs    : none")
+        if result.get("request_hex"):
+            print(f"  Request       : {result.get('request_hex')}")
+            print(f"  Response      : {result.get('response_hex') or '<timeout>'}")
+            print(f"  Responsive    : {result.get('responsive', False)}")
+        if result.get("probe") == "seri":
+            print(f"  SERI Echo     : {result.get('matched', False)}")
+
     elif op in ("exituimlk", "exit"):
         print(f"  Method        : {result.get('method', '')}")
 
@@ -728,6 +920,7 @@ def parse_args():
             "readpin", "resetpin",
             "maintenance_bit",
             "batch",
+            "probe",
             "exituimlk", "exit",
         ],
         required=True,
@@ -771,6 +964,30 @@ def parse_args():
         help="USB interface number"
     )
     parser.add_argument(
+        "--ep-out",
+        type=parse_usb_endpoint,
+        default=0x04,
+        help="USB OUT endpoint in hex"
+    )
+    parser.add_argument(
+        "--ep-in",
+        type=parse_usb_endpoint,
+        default=0x84,
+        help="USB IN endpoint in hex"
+    )
+    parser.add_argument(
+        "--probe-kind",
+        choices=["list", "seri", "scdp"],
+        default="list",
+        help="probe USB layout, SERI, or SCDP"
+    )
+    parser.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=1.0,
+        help="active probe timeout in seconds"
+    )
+    parser.add_argument(
         "--profile",
         choices=["basic", "uimlk"],
         default="basic",
@@ -803,19 +1020,36 @@ def main():
     if args.op == "maintenance_bit" and args.control is None:
         sys.exit("Error: --op maintenance_bit requires --control 0 or 1")
 
+    if args.ep_out & 0x80:
+        sys.exit("Error: --ep-out must be an OUT endpoint (bit 7 clear, e.g. 04)")
+    if not args.ep_in & 0x80:
+        sys.exit("Error: --ep-in must be an IN endpoint (bit 7 set, e.g. 84)")
+    if args.probe_timeout <= 0:
+        sys.exit("Error: --probe-timeout must be greater than zero")
+
     dev = AuRokkuDevice(
         vid=args.vid,
         pid=args.pid,
         sn=args.sn,
         interface=args.interface,
+        ep_out=args.ep_out,
+        ep_in=args.ep_in,
         verbose=args.verbose,
         type2=args.type2,
     )
 
     try:
-        dev.connect()
+        if args.op == "probe":
+            dev.open_device(require_sn=False)
+            if args.probe_kind != "list":
+                dev.connect(require_sn=False)
+            result = dev.probe(args.probe_kind, timeout_sec=args.probe_timeout)
+        else:
+            dev.connect()
 
-        if args.op == "status":
+        if args.op == "probe":
+            pass
+        elif args.op == "status":
             result = dev.read_status()
         elif args.op == "readuimlk":
             result = dev.read_uimlk()
