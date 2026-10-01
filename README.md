@@ -29,66 +29,66 @@ python3 -m pip install pyusb
 Display the current device status:
 
 ```bash
-python3 auRokku.py --op status
+python3 auRokku.py --vid 0482 --pid 0a5c --op status
 ```
 
 Read the UIM lock state:
 
 ```bash
-python3 auRokku.py --op readuimlk
+python3 auRokku.py --vid 0482 --pid 0a5c --op readuimlk
 ```
 
 Read the ICCID record or phone lock code:
 
 ```bash
-python3 auRokku.py --op readiccid
-python3 auRokku.py --op readpin
+python3 auRokku.py --vid 0482 --pid 0a5c --op readiccid
+python3 auRokku.py --vid 0482 --pid 0a5c --op readpin
 ```
 
 Clear the UIM lock binding:
 
 ```bash
-python3 auRokku.py --op clearlk
+python3 auRokku.py --vid 0482 --pid 0a5c --op clearlk
 ```
 
 Write a four-byte UIM lock value:
 
 ```bash
-python3 auRokku.py --op writelk --val 80e48ed2 --control 1
+python3 auRokku.py --vid 0482 --pid 0a5c --op writelk --val 80e48ed2 --control 1
 ```
 
 Reset the phone lock code to `1234`:
 
 ```bash
-python3 auRokku.py --op resetpin
+python3 auRokku.py --vid 0482 --pid 0a5c --op resetpin
 ```
 
 Change the maintenance bit:
 
 ```bash
-python3 auRokku.py --op maintenance_bit --control 1
-python3 auRokku.py --op maintenance_bit --control 0
+python3 auRokku.py --vid 0482 --pid 0a5c --op maintenance_bit --control 1
+python3 auRokku.py --vid 0482 --pid 0a5c --op maintenance_bit --control 0
 ```
 
 Run a grouped read profile:
 
 ```bash
-python3 auRokku.py --op batch --profile basic
-python3 auRokku.py --op batch --profile uimlk
+python3 auRokku.py --vid 0482 --pid 0a5c --op batch --profile basic
+python3 auRokku.py --vid 0482 --pid 0a5c --op batch --profile uimlk
 ```
 
 Exit the current service mode:
 
 ```bash
-python3 auRokku.py --op exit
-python3 auRokku.py --op exituimlk
+python3 auRokku.py --vid 0482 --pid 0a5c --op exit
+python3 auRokku.py --vid 0482 --pid 0a5c --op exituimlk
 ```
 
 Use `--json` for machine-readable output or `--verbose` to display USB traffic:
 
 ```bash
-python3 auRokku.py --op status --json
-python3 auRokku.py --op status --verbose
+python3 auRokku.py --vid 0482 --pid 0a5c --op status --json
+python3 auRokku.py --vid 0482 --pid 0a5c --op status --verbose
 ```
 
 Use `--help` to display all available options.
@@ -129,17 +129,17 @@ The SCDP probe sends only `8e` and reports the raw bounded response. Keep SERI a
 
 ## Device Selection
 
-The default USB IDs are vendor `0482` and product `0a5c`. Override them when required:
+Both `--vid` and `--pid` are required hexadecimal USB IDs. Replace the example values with your device IDs:
 
 ```bash
 python3 auRokku.py --op status --vid 0482 --pid 0a5c
 ```
 
-auRokku normally reads the serial number from the USB descriptor. If it is unavailable, provide either the 11-character serial number or the raw Hex NV value:
+auRokku normally reads the serial number from the USB descriptor. If it is unavailable, provide either the 11-character serial number or the raw hexadecimal Type2Auth value:
 
 ```bash
-python3 auRokku.py --op status --sn SKYKA077394
-python3 auRokku.py --op status --sn 947307414B594B53
+python3 auRokku.py --vid 0482 --pid 0a5c --op status --sn SKYKA077394
+python3 auRokku.py --vid 0482 --pid 0a5c --op status --sn 947307414B594B53
 ```
 
 ## Authentication Modes
@@ -149,7 +149,7 @@ KYY06, KYY09, and KYY10 require Type 2 authentication.
 Use `--type2` for phones that require base `52/53` authentication:
 
 ```bash
-python3 auRokku.py --op status --type2
+python3 auRokku.py --vid 0482 --pid 0a5c --op status --type2
 ```
 
 ## Warning

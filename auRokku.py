@@ -46,35 +46,13 @@ def decode_lockcode_digits(data: bytes) -> str:
     return "".join(digits)
 
 
-def parse_sn_to_nv10077(sn_str: str) -> tuple[bytes, str]:
+def parse_sn_to_type2auth(sn_str: str) -> tuple[bytes, str]:
     s = sn_str.strip()
-
-    if len(s) == 11 and s.isascii() and s[:5].isalpha() and s[5:].isdigit():
-        ascii_bytes = s[:5].upper().encode("ascii")
-        bcd_bytes = bytes.fromhex(s[5:])
-        forward = ascii_bytes + bcd_bytes
-        nv_raw = forward[::-1]
-        return nv_raw, s.upper()
-
     if len(s) == 16:
-        try:
-            nv_raw = bytes.fromhex(s)
-            if len(nv_raw) != 8:
-                raise ValueError("Expected exactly eight bytes")
-            forward = nv_raw[::-1]
-            ascii_part = forward[:5].decode("ascii", errors="replace")
-            bcd_part = forward[5:].hex()
-            if ascii_part.isalpha() and bcd_part.isdigit():
-                canonical_name = f"{ascii_part}{bcd_part}"
-            else:
-                canonical_name = s.upper()
-            return nv_raw, canonical_name
-        except ValueError:
-            pass
-
-    raise ValueError(
-        f"Invalid SN format: '{sn_str}'"
-    )
+        auth_raw = bytes.fromhex(s)
+        return auth_raw, s.upper()
+    forward = s[:5].upper().encode("ascii") + bytes.fromhex(s[5:])
+    return forward[::-1], s.upper()
 
 
 def parse_usb_endpoint(value: str) -> int:
@@ -91,29 +69,29 @@ def bitrev8(b: int) -> int:
     return int(f"{b:08b}"[::-1], 2)
 
 
-def derive_k(nv_raw: bytes) -> bytes:
-    if len(nv_raw) != 8:
-        raise ValueError(f"Key material must be exactly 8 bytes, got {len(nv_raw)}")
-    s = nv_raw[::-1]
+def derive_type2auth_key(auth_raw: bytes) -> bytes:
+    if len(auth_raw) != 8:
+        raise ValueError(f"Key material must be exactly 8 bytes, got {len(auth_raw)}")
+    s = auth_raw[::-1]
     return bytes([
         bitrev8(s[2]), s[5], s[7], bitrev8(s[3]),
         s[0], bitrev8(s[6]), bitrev8(s[4]), s[1],
     ])
 
 
-def compute_auth_request(service: str, challenge: bytes, nv_raw: bytes) -> bytes:
+def compute_type2auth_request(service: str, challenge: bytes, auth_raw: bytes) -> bytes:
     if len(challenge) != 8:
         raise ValueError(f"Challenge must be 8 decoded bytes, got {len(challenge)}")
     if service not in ("base", "uimlk", "2000", "4000"):
         raise ValueError(f"Unsupported authentication service: {service}")
 
     if service == "4000":
-        s = nv_raw[::-1]
+        s = auth_raw[::-1]
         k = bytes([s[0], s[5], s[2], s[7], s[4], s[3], bitrev8(s[6]), s[1]])
         digest = hashlib.md5(k + challenge).digest()
         proof = digest[:8]
     else:
-        k = derive_k(nv_raw)
+        k = derive_type2auth_key(auth_raw)
         digest = hashlib.md5(k + challenge).digest()
         proof = digest[8:]
 
@@ -123,8 +101,8 @@ def compute_auth_request(service: str, challenge: bytes, nv_raw: bytes) -> bytes
 class AuRokkuDevice:
     def __init__(
         self,
-        vid: int = 0x0482,
-        pid: int = 0x0A5C,
+        vid: int,
+        pid: int,
         sn: str | None = None,
         interface: int | None = None,
         ep_out: int = 0x04,
@@ -147,7 +125,7 @@ class AuRokkuDevice:
 
         self.device = None
         self.claimed = False
-        self.nv_material: bytes | None = None
+        self.type2auth_material: bytes | None = None
         self.rx_buffer = bytearray()
         self.async_events: list[dict[str, Any]] = []
         self.exit_result: dict[str, Any] | None = None
@@ -213,7 +191,7 @@ class AuRokkuDevice:
             self.device = usb.core.find(idVendor=self.vid, idProduct=self.pid)
             if self.device is None:
                 raise RuntimeError(f"Device {self.vid:04x}:{self.pid:04x} not found")
-        elif not require_sn or self.nv_material is not None:
+        elif not require_sn or self.type2auth_material is not None:
             return
 
         if not require_sn:
@@ -236,12 +214,12 @@ class AuRokkuDevice:
         else:
             raise RuntimeError("Cannot determine device SN. Please provide --sn <11_chars_or_16_hex> explicitly.")
 
-        self.nv_material, canonical_sn = parse_sn_to_nv10077(use_sn)
+        self.type2auth_material, canonical_sn = parse_sn_to_type2auth(use_sn)
         self.sn = canonical_sn
 
         if self.verbose:
             print(f"[INFO] Device SN: {self.sn}", file=sys.stderr)
-            print(f"[INFO] NV10077 Raw: {self.nv_material.hex(' ')}", file=sys.stderr)
+            print(f"[INFO] Type2Auth Raw: {self.type2auth_material.hex(' ')}", file=sys.stderr)
 
     def connect(self, require_sn: bool = True):
         self.open_device(require_sn=require_sn)
@@ -430,7 +408,7 @@ class AuRokkuDevice:
                 except Exception:
                     pass
                 self.claimed = False
-            if getattr(self, "vid", 0x0482) != 0x0FCE:
+            if self.vid != 0x0FCE:
                 try:
                     usb.util.dispose_resources(self.device)
                 except Exception:
@@ -455,7 +433,7 @@ class AuRokkuDevice:
             raise RuntimeError(f"Invalid challenge frame for {service_name}: {resp.hex(' ')}")
         challenge = decode_nibbles(resp[1:])
 
-        auth_pkt = compute_auth_request(service_name, challenge, self.nv_material)
+        auth_pkt = compute_type2auth_request(service_name, challenge, self.type2auth_material)
         self.send(auth_pkt)
         auth_resp = self.recv(2)
         if auth_resp != b"\x53\x01":
@@ -464,7 +442,7 @@ class AuRokkuDevice:
 
     def enter_base(self):
         self.drain()
-        if getattr(self, "vid", 0x0482) != 0x0FCE:
+        if self.vid != 0x0FCE:
             try:
                 self.send(b"\xd8")
                 time.sleep(0.05)
@@ -503,7 +481,7 @@ class AuRokkuDevice:
             pass
 
     def exit_mode(self) -> bytes | None:
-        if getattr(self, "vid", 0x0482) != 0x0FCE:
+        if self.vid != 0x0FCE:
             self.exit_base()
             return b"\xd8"
         return None
@@ -929,20 +907,20 @@ def parse_args():
     parser.add_argument(
         "--vid",
         type=lambda x: int(x, 16),
-        default="0482",
+        required=True,
         help="USB vendor ID in hex"
     )
     parser.add_argument(
         "--pid",
         type=lambda x: int(x, 16),
-        default="0a5c",
+        required=True,
         help="USB product ID in hex"
     )
     parser.add_argument(
         "--sn",
         type=str,
         default=None,
-        help="11-character serial number or 16-hex NV10077 value"
+        help="11-character serial number or 16-hex Type2Auth value"
     )
     parser.add_argument(
         "--val",
